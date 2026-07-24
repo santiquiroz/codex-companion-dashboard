@@ -1,0 +1,29 @@
+{
+  "name": "codex-companion-dashboard",
+  "version": "0.1.0",
+  "description": "Cross-project terminal and web dashboard for Codex Companion background jobs in Claude Code",
+  "type": "module",
+  "bin": {
+    "codex-dashboard": "./bin/codex-dashboard.mjs",
+    "codex-dashboard-gui": "./bin/codex-dashboard-server.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "author": "Santiago Quiroz",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/santiquiroz/codex-companion-dashboard.git"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "codex-companion",
+    "dashboard",
+    "cli"
+  ],
+  "files": [
+    "bin"
+  ]
+}
