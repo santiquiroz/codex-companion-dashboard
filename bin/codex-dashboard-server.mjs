@@ -874,9 +874,35 @@ function isMainModule() {
   }
 }
 
+function startupErrorMessage(error, port) {
+  if (error.code === "EADDRINUSE") {
+    return `Port ${port} is already in use on ${HOST}. Stop the other process or pass --port <n> (0 picks a free port).`;
+  }
+  return `Codex Dashboard could not start: ${error.message}`;
+}
+
+function reportStartupError(message) {
+  console.error(message);
+  process.exitCode = 1;
+}
+
+function parseArgsOrReport(argv) {
+  try {
+    return parseServerArgs(argv);
+  } catch (error) {
+    reportStartupError(error.message);
+    return null;
+  }
+}
+
 function main(argv) {
-  const { port, openBrowser } = parseServerArgs(argv);
+  const options = parseArgsOrReport(argv);
+  if (!options) {
+    return;
+  }
+  const { port, openBrowser } = options;
   const server = createServer({ openBrowser });
+  server.once("error", (error) => reportStartupError(startupErrorMessage(error, port)));
   server.listen(port, HOST, () => {
     console.log(`Codex Dashboard running at ${serverUrl(server)}`);
   });
