@@ -62,6 +62,26 @@ describe("isJobCommandLine", () => {
   test("rejects an unrelated process", () => {
     assert.equal(isJobCommandLine(FOREIGN_COMMAND_LINE, "task-abc123"), false);
   });
+
+  test("rejects the dashboard itself, whose path only contains codex-companion", () => {
+    const dashboard =
+      '"C:\\Program Files\\nodejs\\node.exe" C:\\personal\\codex-companion-dashboard\\bin\\codex-dashboard-server.mjs';
+
+    assert.equal(isJobCommandLine(dashboard, "task-abc123"), false);
+  });
+
+  test("rejects a process that only receives a file under the companion state dir", () => {
+    const logViewer =
+      "notepad.exe C:\\Users\\me\\AppData\\Local\\Temp\\codex-companion\\repo-0123456789abcdef\\jobs\\task-abc123.log";
+
+    assert.equal(isJobCommandLine(logViewer, "task-abc123"), false);
+  });
+
+  test("accepts the companion script behind a quoted path with spaces", () => {
+    const quoted = 'node "C:\\Users\\Some User\\plugins\\scripts\\Codex-Companion.mjs" task-worker --job-id task-abc123';
+
+    assert.equal(isJobCommandLine(quoted, "task-abc123"), true);
+  });
 });
 
 describe("livenessFromInspection", () => {
