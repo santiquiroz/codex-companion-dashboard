@@ -37,9 +37,12 @@ codex-dashboard-gui --port 0 --no-open   # any free port, don't open the browser
 
 The GUI lets you:
 - See every job (running, queued, completed, failed, cancelled) across every repo, auto-refreshing.
-- Spot **stale** jobs — entries stuck as "running"/"queued" whose process has actually died (session closed, machine slept, etc.) — flagged automatically by checking whether the recorded PID is still alive.
-- Cancel a job (best-effort process kill + marks it cancelled) or bulk-purge every stale one.
+- Spot **stale** jobs — entries stuck as "running"/"queued" whose process has actually died (session closed, machine slept, etc.). A job is stale only when its recorded PID is gone or now belongs to another program: the process must be running the plugin's `codex-companion.mjs` (and, for a `task-worker`, with that job's `--job-id`). If the command line cannot be read (for example, an elevated process), the job is not flagged as stale.
+- Cancel a job. When its worker is verified live and the job records its workspace, the dashboard runs the plugin's own `codex-companion.mjs cancel <id> --cwd <workspace> --json`, which also interrupts the Codex turn. Otherwise it kills the verified worker (never an unrelated process) and marks the job cancelled in `state.json` and `jobs/<id>.json`.
+- Bulk-purge every stale job: marks them cancelled without killing anything, and skips a repo whose state file is locked by the plugin.
 - Delete old finished job entries you don't need to keep around.
+
+State files are written under the plugin's `state.lock` and replaced atomically, so the dashboard and the plugin do not overwrite each other.
 
 ## How it finds jobs
 
@@ -51,6 +54,12 @@ Codex Companion stores per-repo job state under one of:
 ```
 
 Both locations are checked automatically. If your install uses a different path, set `CODEX_COMPANION_STATE_DIR` to override.
+
+## Development
+
+```bash
+npm test    # node --test; uses temporary state directories and fake processes
+```
 
 ## License
 
