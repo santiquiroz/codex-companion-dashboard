@@ -667,12 +667,13 @@ const HTML_PAGE = `<!doctype html>
         render();
         setConnection("Working…", false);
         try {
-          await requestJson(url, {
+          var payload = await requestJson(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: body === undefined ? undefined : JSON.stringify(body)
           });
-          setConnection(successMessage, false);
+          var message = typeof successMessage === "function" ? successMessage(payload) : successMessage;
+          setConnection(message, false);
         } catch (error) {
           setConnection(error.message || String(error), true);
         } finally {
@@ -695,6 +696,16 @@ const HTML_PAGE = `<!doctype html>
       filterElement.addEventListener("input", render);
       autoRefreshElement.addEventListener("change", syncAutoRefresh);
 
+      function purgeResultMessage(payload) {
+        var purgedCount = (payload.purged || []).length;
+        var skippedCount = (payload.skipped || []).length;
+        var message = "Purged " + purgedCount + " stale job(s).";
+        if (skippedCount > 0) {
+          message += " Skipped " + skippedCount + " repo(s) whose state file was locked; retry later.";
+        }
+        return message;
+      }
+
       purgeElement.addEventListener("click", function () {
         var staleCount = dashboard.jobs.filter(function (job) {
           return job.stale === true;
@@ -703,11 +714,7 @@ const HTML_PAGE = `<!doctype html>
           return;
         }
         if (window.confirm("Cancel " + staleCount + " stale job(s)?")) {
-          runMutation(
-            "/api/jobs/purge-stale",
-            undefined,
-            "Purged " + staleCount + " stale job(s)."
-          );
+          runMutation("/api/jobs/purge-stale", undefined, purgeResultMessage);
         }
       });
 
