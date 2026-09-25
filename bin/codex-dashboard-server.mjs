@@ -5,6 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { createLivenessProbe, killIfJobProcess } from "../lib/process-identity.mjs";
 import { StateLockBusyError, withStateLock, writeStateAtomic } from "../lib/state-store.mjs";
 
 const HOST = "127.0.0.1";
@@ -15,6 +16,7 @@ const BASE_DIRS = [
 ];
 const ACTIVE_STATUSES = new Set(["running", "queued"]);
 const MAX_BODY_BYTES = 1024 * 1024;
+const livenessProbe = createLivenessProbe();
 
 class HttpError extends Error {
   constructor(statusCode, message) {
@@ -37,29 +39,16 @@ function parsePort(argv) {
   return port;
 }
 
-function isFiniteNumericPid(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function probeAlive(pid) {
-  if (!isFiniteNumericPid(pid)) {
-    return null;
-  }
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function isJobRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function isStaleJob(job) {
-  return ACTIVE_STATUSES.has(job.status) && probeAlive(job.pid) === false;
+async function probeActiveJob(job) {
+  return ACTIVE_STATUSES.has(job.status) ? livenessProbe.probe(job) : null;
+}
+
+function isStaleLiveness(job, alive) {
+  return ACTIVE_STATUSES.has(job.status) && alive === false;
 }
 
 function readStateFile(statePath) {
@@ -71,7 +60,7 @@ function readStateFile(statePath) {
   }
 }
 
-function scanAllJobRecords() {
+function collectJobRecords() {
   const records = [];
   const seen = new Set();
 
@@ -108,16 +97,12 @@ function scanAllJobRecords() {
         }
         seen.add(dedupeKey);
 
-        const alive = probeAlive(sourceJob.pid);
-        const stale = ACTIVE_STATUSES.has(sourceJob.status) && alive === false;
         records.push({
           view: {
             ...sourceJob,
             repo,
             dirName,
             baseDir,
-            alive,
-            stale,
           },
           sourceJob,
           statePath,
@@ -132,11 +117,17 @@ function scanAllJobRecords() {
   return records;
 }
 
-function bestEffortKill(pid) {
-  if (!isFiniteNumericPid(pid)) {
-    return;
-  }
+async function withLiveness(record) {
+  const alive = await probeActiveJob(record.sourceJob);
+  const stale = isStaleLiveness(record.sourceJob, alive);
+  return { ...record, view: { ...record.view, alive, stale } };
+}
 
+async function scanAllJobRecords() {
+  return Promise.all(collectJobRecords().map(withLiveness));
+}
+
+function bestEffortKill(pid) {
   try {
     if (process.platform === "win32") {
       spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
@@ -279,15 +270,15 @@ function cancelActiveJob(state, jobId) {
   return job;
 }
 
-function stopCancelledJob(job) {
-  bestEffortKill(job.pid);
+async function stopCancelledJob(job) {
+  await killIfJobProcess(job, { probe: livenessProbe, kill: bestEffortKill });
   bestEffortAppendCancellationLog(job, job.completedAt);
 }
 
 async function cancelOneJob(body) {
   const target = requireJobTarget(body);
   const job = await mutateTargetState(target, (state) => cancelActiveJob(state, target.jobId));
-  stopCancelledJob(job);
+  await stopCancelledJob(job);
   return job;
 }
 
@@ -298,23 +289,31 @@ function groupStaleJobsByStateFile(records) {
       statePath: record.statePath,
       dirName: record.dirName,
       repo: record.repo,
-      jobIds: new Set(),
+      stalePids: new Map(),
     };
-    group.jobIds.add(record.sourceJob.id);
+    group.stalePids.set(record.sourceJob.id, record.sourceJob.pid);
     groups.set(record.statePath, group);
   }
   return [...groups.values()];
 }
 
-async function cancelJobsStillStale(statePath, jobIds) {
+// The scan already proved these PIDs dead or foreign; re-inspecting here would run a subprocess under the lock.
+function isStillStale(job, stalePids) {
+  return (
+    isJobRecord(job) &&
+    ACTIVE_STATUSES.has(job.status) &&
+    stalePids.has(job.id) &&
+    stalePids.get(job.id) === job.pid
+  );
+}
+
+async function cancelJobsStillStale(statePath, stalePids) {
   const state = readStateFile(statePath);
   if (!state) {
     return [];
   }
 
-  const jobs = state.jobs.filter(
-    (job) => isJobRecord(job) && jobIds.has(job.id) && isStaleJob(job),
-  );
+  const jobs = state.jobs.filter((job) => isStillStale(job, stalePids));
   if (jobs.length === 0) {
     return [];
   }
@@ -328,7 +327,7 @@ async function cancelJobsStillStale(statePath, jobIds) {
 async function purgeStateFile(group) {
   try {
     return await withStateLock(path.dirname(group.statePath), () =>
-      cancelJobsStillStale(group.statePath, group.jobIds),
+      cancelJobsStillStale(group.statePath, group.stalePids),
     );
   } catch (error) {
     if (error instanceof StateLockBusyError) {
@@ -342,7 +341,7 @@ async function purgeStaleJobs() {
   const purged = [];
   const skipped = [];
 
-  for (const group of groupStaleJobsByStateFile(scanAllJobRecords())) {
+  for (const group of groupStaleJobsByStateFile(await scanAllJobRecords())) {
     const jobs = await purgeStateFile(group);
     if (jobs === null) {
       skipped.push({ dirName: group.dirName, repo: group.repo, reason: "state file locked" });
@@ -350,7 +349,8 @@ async function purgeStaleJobs() {
     }
 
     for (const job of jobs) {
-      stopCancelledJob(job);
+      // A stale PID is dead or belongs to an unrelated process, so purging never kills anything.
+      bestEffortAppendCancellationLog(job, job.completedAt);
       purged.push({ dirName: group.dirName, jobId: job.id, repo: group.repo });
     }
   }
@@ -1118,7 +1118,7 @@ async function handleRequest(request, response) {
   }
 
   if (request.method === "GET" && pathname === "/api/jobs") {
-    const jobs = scanAllJobRecords().map((record) => record.view);
+    const jobs = (await scanAllJobRecords()).map((record) => record.view);
     sendJson(response, 200, { jobs });
     return;
   }
