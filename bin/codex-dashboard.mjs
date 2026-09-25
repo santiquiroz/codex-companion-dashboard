@@ -5,9 +5,9 @@
 import process from "node:process";
 import { collectJobRecords, uniqueBy } from "../lib/job-records.mjs";
 import { buildTable } from "../lib/job-table.mjs";
-import { defaultStateDirs } from "../lib/state-dirs.mjs";
+import { resolveStateDirs } from "../lib/state-dirs.mjs";
 
-const BASE_DIRS = [process.env.CODEX_COMPANION_STATE_DIR, ...defaultStateDirs()].filter(Boolean);
+const BASE_DIRS = resolveStateDirs();
 const WATCH_INTERVAL_MS = 3000;
 
 function readAllJobs() {

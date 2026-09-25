@@ -6,7 +6,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { createJobActions } from "../lib/job-actions.mjs";
 import { HttpError, samePath } from "../lib/job-target.mjs";
-import { defaultStateDirs } from "../lib/state-dirs.mjs";
+import { resolveStateDirs } from "../lib/state-dirs.mjs";
 import { StateLockBusyError } from "../lib/state-store.mjs";
 
 const HOST = "127.0.0.1";
@@ -839,7 +839,7 @@ function launchBrowserOnWindows(url) {
 }
 
 export function createServer({
-  baseDirs = defaultStateDirs(),
+  baseDirs = resolveStateDirs(),
   openBrowser = false,
   launchBrowser = launchBrowserOnWindows,
 } = {}) {
