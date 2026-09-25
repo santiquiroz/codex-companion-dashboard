@@ -20,9 +20,11 @@ export function createSandbox() {
   return { root, home, temp, baseDir, repoDir, statePath: path.join(repoDir, "state.json") };
 }
 
-export function sandboxEnv(sandbox) {
+export function sandboxEnv(sandbox, extraEnv = {}) {
   const env = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !/^(comspec|userprofile|home|temp|tmp|tmpdir)$/i.test(key)),
+    Object.entries(process.env).filter(
+      ([key]) => !/^(comspec|userprofile|home|temp|tmp|tmpdir|codex_companion_script)$/i.test(key),
+    ),
   );
   // An unusable shell makes the server's Windows "start <url>" fail instead of opening a browser.
   env.ComSpec = path.join(sandbox.root, "no-shell.exe");
@@ -31,7 +33,7 @@ export function sandboxEnv(sandbox) {
   env.TEMP = sandbox.temp;
   env.TMP = sandbox.temp;
   env.TMPDIR = sandbox.temp;
-  return env;
+  return { ...env, ...extraEnv };
 }
 
 export function findFreePort() {
@@ -59,10 +61,10 @@ export function waitForListening(child) {
   });
 }
 
-export async function startServer(sandbox) {
+export async function startServer(sandbox, extraEnv) {
   const port = await findFreePort();
   const child = spawn(process.execPath, [SERVER_SCRIPT, "--port", String(port)], {
-    env: sandboxEnv(sandbox),
+    env: sandboxEnv(sandbox, extraEnv),
     stdio: ["ignore", "pipe", "inherit"],
     windowsHide: true,
   });

@@ -5,17 +5,17 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { companionEnvFor, findCompanionScript, runCompanionCancel } from "../lib/companion-cancel.mjs";
 import { createLivenessProbe, killIfJobProcess } from "../lib/process-identity.mjs";
 import { StateLockBusyError, withStateLock, writeStateAtomic } from "../lib/state-store.mjs";
 
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 4317;
-const BASE_DIRS = [
-  path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state"),
-  path.join(os.tmpdir(), "codex-companion"),
-];
+const PLUGIN_DATA_STATE_DIR = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state");
+const BASE_DIRS = [PLUGIN_DATA_STATE_DIR, path.join(os.tmpdir(), "codex-companion")];
 const ACTIVE_STATUSES = new Set(["running", "queued"]);
 const MAX_BODY_BYTES = 1024 * 1024;
+const DASHBOARD_CANCEL_MESSAGE = "Cancelled via dashboard.";
 const livenessProbe = createLivenessProbe();
 
 class HttpError extends Error {
@@ -156,11 +156,44 @@ function bestEffortAppendCancellationLog(job, timestamp) {
   }
 }
 
-function markCancelled(job, timestamp) {
-  job.status = "cancelled";
-  job.phase = "cancelled";
-  job.completedAt = timestamp;
-  job.updatedAt = timestamp;
+function cancelledJob(job, timestamp) {
+  return {
+    ...job,
+    status: "cancelled",
+    phase: "cancelled",
+    pid: null,
+    errorMessage: DASHBOARD_CANCEL_MESSAGE,
+    completedAt: timestamp,
+    cancelledAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function jobFilePath(repoDir, jobId) {
+  return path.join(repoDir, "jobs", `${jobId}.json`);
+}
+
+function readJobFile(filePath) {
+  try {
+    const job = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return isJobRecord(job) ? job : null;
+  } catch {
+    return null;
+  }
+}
+
+// Mirrors the plugin's cancel: /codex:status and /codex:result read jobs/<id>.json, not state.json.
+async function bestEffortMergeIntoJobFile(repoDir, job) {
+  const filePath = jobFilePath(repoDir, job.id);
+  const existing = readJobFile(filePath);
+  if (!existing) {
+    return;
+  }
+  try {
+    await writeStateAtomic(filePath, { ...existing, ...job });
+  } catch {
+    // state.json already records the cancellation; the sidecar must not fail the request.
+  }
 }
 
 function isNonEmptyString(value) {
@@ -257,7 +290,7 @@ async function mutateTargetState(target, mutate) {
   });
 }
 
-function cancelActiveJob(state, jobId) {
+function requireActiveJob(state, jobId) {
   const job = findJob(state, jobId);
   if (!job) {
     throw new HttpError(404, "Job not found.");
@@ -265,21 +298,71 @@ function cancelActiveJob(state, jobId) {
   if (!ACTIVE_STATUSES.has(job.status)) {
     throw new HttpError(400, "Only running or queued jobs can be cancelled.");
   }
-
-  markCancelled(job, new Date().toISOString());
   return job;
 }
 
-async function stopCancelledJob(job) {
-  await killIfJobProcess(job, { probe: livenessProbe, kill: bestEffortKill });
-  bestEffortAppendCancellationLog(job, job.completedAt);
+function cancelActiveJob(state, jobId) {
+  const original = requireActiveJob(state, jobId);
+  const cancelled = cancelledJob(original, new Date().toISOString());
+  state.jobs = state.jobs.map((job) => (job === original ? cancelled : job));
+  return { original, cancelled };
+}
+
+async function stopCancelledJob(original, cancelled) {
+  await killIfJobProcess(original, { probe: livenessProbe, kill: bestEffortKill });
+  bestEffortAppendCancellationLog(cancelled, cancelled.completedAt);
+}
+
+async function cancelInDashboard(target) {
+  const { original, cancelled } = await mutateTargetState(target, (state) =>
+    cancelActiveJob(state, target.jobId),
+  );
+  await bestEffortMergeIntoJobFile(target.repoDir, cancelled);
+  await stopCancelledJob(original, cancelled);
+  return cancelled;
+}
+
+function hasCancelArguments(job) {
+  return (
+    isNonEmptyString(job.workspaceRoot) &&
+    path.isAbsolute(job.workspaceRoot) &&
+    !job.id.startsWith("-")
+  );
+}
+
+// Only a verified live worker goes to the plugin: its cancel kills job.pid without checking whose it is.
+async function shouldDelegateCancel(job) {
+  return hasCancelArguments(job) && (await livenessProbe.probeFresh(job)) === true;
+}
+
+async function cancelViaCompanion(target, job) {
+  const script = findCompanionScript();
+  if (!script || !(await shouldDelegateCancel(job))) {
+    return { handled: false, plugin: null };
+  }
+
+  const plugin = await runCompanionCancel({
+    script,
+    jobId: job.id,
+    workspaceRoot: job.workspaceRoot,
+    env: companionEnvFor(target.baseDir, { pluginDataStateDir: PLUGIN_DATA_STATE_DIR, samePath }),
+  });
+  // The state file decides, not the exit code: the plugin may have resolved another state directory.
+  const current = findJob(readTargetState(target), target.jobId);
+  return { handled: current?.status === "cancelled", plugin, job: current };
 }
 
 async function cancelOneJob(body) {
   const target = requireJobTarget(body);
-  const job = await mutateTargetState(target, (state) => cancelActiveJob(state, target.jobId));
-  await stopCancelledJob(job);
-  return job;
+  const job = requireActiveJob(readTargetState(target), target.jobId);
+
+  const delegated = await cancelViaCompanion(target, job);
+  if (delegated.handled) {
+    return { job: delegated.job, cancelledVia: "plugin", plugin: delegated.plugin };
+  }
+
+  const cancelled = await cancelInDashboard(target);
+  return { job: cancelled, cancelledVia: "dashboard", plugin: delegated.plugin };
 }
 
 function groupStaleJobsByStateFile(records) {
@@ -319,9 +402,10 @@ async function cancelJobsStillStale(statePath, stalePids) {
   }
 
   const timestamp = new Date().toISOString();
-  jobs.forEach((job) => markCancelled(job, timestamp));
-  await writeStateAtomic(statePath, state);
-  return jobs;
+  const replacements = new Map(jobs.map((job) => [job, cancelledJob(job, timestamp)]));
+  const nextState = { ...state, jobs: state.jobs.map((job) => replacements.get(job) ?? job) };
+  await writeStateAtomic(statePath, nextState);
+  return [...replacements.values()];
 }
 
 async function purgeStateFile(group) {
@@ -350,6 +434,7 @@ async function purgeStaleJobs() {
 
     for (const job of jobs) {
       // A stale PID is dead or belongs to an unrelated process, so purging never kills anything.
+      await bestEffortMergeIntoJobFile(path.dirname(group.statePath), job);
       bestEffortAppendCancellationLog(job, job.completedAt);
       purged.push({ dirName: group.dirName, jobId: job.id, repo: group.repo });
     }
@@ -1125,8 +1210,8 @@ async function handleRequest(request, response) {
 
   if (request.method === "POST" && pathname === "/api/jobs/cancel") {
     const body = await readJsonBody(request);
-    const job = await cancelOneJob(body);
-    sendJson(response, 200, { ok: true, job });
+    const cancellation = await cancelOneJob(body);
+    sendJson(response, 200, { ok: true, ...cancellation });
     return;
   }
 

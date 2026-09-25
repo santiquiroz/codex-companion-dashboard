@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
-import path from "node:path";
 import process from "node:process";
 import { after, before, describe, test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 
 import {
   REPO_DIR_NAME,
@@ -16,48 +13,12 @@ import {
   stopServer,
   writeStateFixture,
 } from "./helpers/server-sandbox.mjs";
+import { spawnForeignProcess, spawnTaskWorker, stopChild, waitForExit } from "./helpers/fake-processes.mjs";
 
 const JOB_ID = "task-demo-1";
-const IDLE_SCRIPT = "setInterval(() => {}, 1000);\n";
 const EXIT_WAIT_MS = 5_000;
 const SURVIVAL_WAIT_MS = 500;
 const WINDOWS_SYSTEM_PID = 4;
-
-function writeFakeCompanionScript(sandbox) {
-  const scriptPath = path.join(sandbox.root, "scripts", "codex-companion.mjs");
-  fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
-  fs.writeFileSync(scriptPath, IDLE_SCRIPT, "utf8");
-  return scriptPath;
-}
-
-function spawnIdleProcess(args) {
-  return spawn(process.execPath, args, { stdio: "ignore", windowsHide: true });
-}
-
-function spawnForeignProcess() {
-  return spawnIdleProcess(["-e", IDLE_SCRIPT]);
-}
-
-function spawnTaskWorker(sandbox, jobId) {
-  const scriptPath = writeFakeCompanionScript(sandbox);
-  return spawnIdleProcess([scriptPath, "task-worker", "--cwd", sandbox.root, "--job-id", jobId]);
-}
-
-function waitForExit(child, timeoutMs) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve(true);
-  }
-  return Promise.race([
-    new Promise((resolve) => child.once("exit", () => resolve(true))),
-    delay(timeoutMs).then(() => false),
-  ]);
-}
-
-function stopChild(child) {
-  if (child.exitCode === null && child.signalCode === null) {
-    child.kill();
-  }
-}
 
 function writeRunningJob(sandbox, pid) {
   writeStateFixture(sandbox, [buildJob({ id: JOB_ID, status: "running", phase: "running", pid })]);
