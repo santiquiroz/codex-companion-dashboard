@@ -7,6 +7,9 @@
     "codex-dashboard": "./bin/codex-dashboard.mjs",
     "codex-dashboard-gui": "./bin/codex-dashboard-server.mjs"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "engines": {
     "node": ">=18"
   },
@@ -24,6 +27,7 @@
     "cli"
   ],
   "files": [
-    "bin"
+    "bin",
+    "lib"
   ]
 }

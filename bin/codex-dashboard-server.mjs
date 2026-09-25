@@ -5,6 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { StateLockBusyError, withStateLock, writeStateAtomic } from "../lib/state-store.mjs";
 
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 4317;
@@ -53,6 +54,23 @@ function probeAlive(pid) {
   }
 }
 
+function isJobRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isStaleJob(job) {
+  return ACTIVE_STATUSES.has(job.status) && probeAlive(job.pid) === false;
+}
+
+function readStateFile(statePath) {
+  try {
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    return isJobRecord(state) && Array.isArray(state.jobs) ? state : null;
+  } catch {
+    return null;
+  }
+}
+
 function scanAllJobRecords() {
   const records = [];
   const seen = new Set();
@@ -72,55 +90,46 @@ function scanAllJobRecords() {
 
       const dirName = entry.name;
       const statePath = path.join(baseDir, dirName, "state.json");
+      // Missing, unreadable, and malformed state files are intentionally skipped.
+      const state = readStateFile(statePath);
+      if (!state) {
+        continue;
+      }
 
-      try {
-        const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-        if (!state || typeof state !== "object" || !Array.isArray(state.jobs)) {
+      const repo = dirName.replace(/-[0-9a-f]{16}$/, "");
+      for (const sourceJob of state.jobs) {
+        if (!isJobRecord(sourceJob)) {
           continue;
         }
 
-        const repo = dirName.replace(/-[0-9a-f]{16}$/, "");
-        for (const sourceJob of state.jobs) {
-          if (!sourceJob || typeof sourceJob !== "object" || Array.isArray(sourceJob)) {
-            continue;
-          }
+        const dedupeKey = `${dirName}:${sourceJob.id}`;
+        if (seen.has(dedupeKey)) {
+          continue;
+        }
+        seen.add(dedupeKey);
 
-          const dedupeKey = `${dirName}:${sourceJob.id}`;
-          if (seen.has(dedupeKey)) {
-            continue;
-          }
-          seen.add(dedupeKey);
-
-          const alive = probeAlive(sourceJob.pid);
-          const stale = ACTIVE_STATUSES.has(sourceJob.status) && alive === false;
-          records.push({
-            view: {
-              ...sourceJob,
-              repo,
-              dirName,
-              baseDir,
-              alive,
-              stale,
-            },
-            sourceJob,
-            state,
-            statePath,
+        const alive = probeAlive(sourceJob.pid);
+        const stale = ACTIVE_STATUSES.has(sourceJob.status) && alive === false;
+        records.push({
+          view: {
+            ...sourceJob,
             repo,
             dirName,
             baseDir,
-          });
-        }
-      } catch {
-        // Missing, unreadable, and malformed state files are intentionally skipped.
+            alive,
+            stale,
+          },
+          sourceJob,
+          statePath,
+          repo,
+          dirName,
+          baseDir,
+        });
       }
     }
   }
 
   return records;
-}
-
-function writeState(statePath, state) {
-  fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 function bestEffortKill(pid) {
@@ -217,6 +226,7 @@ function requireJobTarget(body) {
     baseDir,
     dirName: body.dirName,
     jobId: body.jobId,
+    repoDir,
     statePath: path.join(repoDir, "state.json"),
   };
 }
@@ -243,11 +253,21 @@ function findJob(state, jobId) {
   return state.jobs.find((job) => job && typeof job === "object" && job.id === jobId);
 }
 
-function cancelOneJob(body) {
-  const target = requireJobTarget(body);
-  const state = readTargetState(target);
-  const job = findJob(state, target.jobId);
+async function mutateTargetState(target, mutate) {
+  if (!fs.existsSync(target.statePath)) {
+    throw new HttpError(404, "Job not found.");
+  }
 
+  return withStateLock(target.repoDir, async () => {
+    const state = readTargetState(target);
+    const result = mutate(state);
+    await writeStateAtomic(target.statePath, state);
+    return result;
+  });
+}
+
+function cancelActiveJob(state, jobId) {
+  const job = findJob(state, jobId);
   if (!job) {
     throw new HttpError(404, "Job not found.");
   }
@@ -255,42 +275,87 @@ function cancelOneJob(body) {
     throw new HttpError(400, "Only running or queued jobs can be cancelled.");
   }
 
-  bestEffortKill(job.pid);
-  const timestamp = new Date().toISOString();
-  markCancelled(job, timestamp);
-  writeState(target.statePath, state);
-  bestEffortAppendCancellationLog(job, timestamp);
-
+  markCancelled(job, new Date().toISOString());
   return job;
 }
 
-function purgeStaleJobs() {
-  const staleRecords = scanAllJobRecords().filter((record) => record.view.stale);
-  const dirtyStates = new Map();
-  const cancellationLogs = [];
-  const purged = [];
+function stopCancelledJob(job) {
+  bestEffortKill(job.pid);
+  bestEffortAppendCancellationLog(job, job.completedAt);
+}
 
-  for (const record of staleRecords) {
-    bestEffortKill(record.sourceJob.pid);
-    const timestamp = new Date().toISOString();
-    markCancelled(record.sourceJob, timestamp);
-    dirtyStates.set(record.statePath, record.state);
-    cancellationLogs.push({ job: record.sourceJob, timestamp });
-    purged.push({
+async function cancelOneJob(body) {
+  const target = requireJobTarget(body);
+  const job = await mutateTargetState(target, (state) => cancelActiveJob(state, target.jobId));
+  stopCancelledJob(job);
+  return job;
+}
+
+function groupStaleJobsByStateFile(records) {
+  const groups = new Map();
+  for (const record of records.filter((candidate) => candidate.view.stale)) {
+    const group = groups.get(record.statePath) ?? {
+      statePath: record.statePath,
       dirName: record.dirName,
-      jobId: record.sourceJob.id,
       repo: record.repo,
-    });
+      jobIds: new Set(),
+    };
+    group.jobIds.add(record.sourceJob.id);
+    groups.set(record.statePath, group);
+  }
+  return [...groups.values()];
+}
+
+async function cancelJobsStillStale(statePath, jobIds) {
+  const state = readStateFile(statePath);
+  if (!state) {
+    return [];
   }
 
-  for (const [statePath, state] of dirtyStates) {
-    writeState(statePath, state);
-  }
-  for (const entry of cancellationLogs) {
-    bestEffortAppendCancellationLog(entry.job, entry.timestamp);
+  const jobs = state.jobs.filter(
+    (job) => isJobRecord(job) && jobIds.has(job.id) && isStaleJob(job),
+  );
+  if (jobs.length === 0) {
+    return [];
   }
 
-  return purged;
+  const timestamp = new Date().toISOString();
+  jobs.forEach((job) => markCancelled(job, timestamp));
+  await writeStateAtomic(statePath, state);
+  return jobs;
+}
+
+async function purgeStateFile(group) {
+  try {
+    return await withStateLock(path.dirname(group.statePath), () =>
+      cancelJobsStillStale(group.statePath, group.jobIds),
+    );
+  } catch (error) {
+    if (error instanceof StateLockBusyError) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function purgeStaleJobs() {
+  const purged = [];
+  const skipped = [];
+
+  for (const group of groupStaleJobsByStateFile(scanAllJobRecords())) {
+    const jobs = await purgeStateFile(group);
+    if (jobs === null) {
+      skipped.push({ dirName: group.dirName, repo: group.repo, reason: "state file locked" });
+      continue;
+    }
+
+    for (const job of jobs) {
+      stopCancelledJob(job);
+      purged.push({ dirName: group.dirName, jobId: job.id, repo: group.repo });
+    }
+  }
+
+  return { purged, skipped };
 }
 
 function bestEffortDeleteFile(filePath) {
@@ -301,11 +366,9 @@ function bestEffortDeleteFile(filePath) {
   }
 }
 
-function deleteOneJob(body) {
-  const target = requireJobTarget(body);
-  const state = readTargetState(target);
+function removeFinishedJob(state, jobId) {
   const jobIndex = state.jobs.findIndex(
-    (job) => job && typeof job === "object" && job.id === target.jobId,
+    (job) => job && typeof job === "object" && job.id === jobId,
   );
 
   if (jobIndex === -1) {
@@ -318,7 +381,11 @@ function deleteOneJob(body) {
   }
 
   state.jobs.splice(jobIndex, 1);
-  writeState(target.statePath, state);
+}
+
+async function deleteOneJob(body) {
+  const target = requireJobTarget(body);
+  await mutateTargetState(target, (state) => removeFinishedJob(state, target.jobId));
 
   const jobsDir = path.join(target.baseDir, target.dirName, "jobs");
   bestEffortDeleteFile(path.join(jobsDir, `${target.jobId}.log`));
@@ -1058,20 +1125,20 @@ async function handleRequest(request, response) {
 
   if (request.method === "POST" && pathname === "/api/jobs/cancel") {
     const body = await readJsonBody(request);
-    const job = cancelOneJob(body);
+    const job = await cancelOneJob(body);
     sendJson(response, 200, { ok: true, job });
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/jobs/purge-stale") {
-    const purged = purgeStaleJobs();
-    sendJson(response, 200, { ok: true, purged });
+    const { purged, skipped } = await purgeStaleJobs();
+    sendJson(response, 200, { ok: true, purged, skipped });
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/jobs/delete") {
     const body = await readJsonBody(request);
-    const deleted = deleteOneJob(body);
+    const deleted = await deleteOneJob(body);
     sendJson(response, 200, { ok: true, deleted });
     return;
   }
@@ -1090,13 +1157,20 @@ async function handleRequest(request, response) {
   response.end(content);
 }
 
+function errorStatusCode(error) {
+  if (error instanceof StateLockBusyError) {
+    return 409;
+  }
+  if (error instanceof HttpError && Number.isInteger(error.statusCode)) {
+    return error.statusCode;
+  }
+  return 500;
+}
+
 const port = parsePort(process.argv.slice(2));
 const server = http.createServer((request, response) => {
   handleRequest(request, response).catch((error) => {
-    const statusCode =
-      error instanceof HttpError && Number.isInteger(error.statusCode)
-        ? error.statusCode
-        : 500;
+    const statusCode = errorStatusCode(error);
     const message = error instanceof Error ? error.message : String(error);
 
     if (!response.headersSent) {
