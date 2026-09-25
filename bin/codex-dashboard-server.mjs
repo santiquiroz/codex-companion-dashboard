@@ -1,30 +1,18 @@
 #!/usr/bin/env node
-import { exec, spawnSync } from "node:child_process";
+import { exec } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
-import os from "node:os";
-import path from "node:path";
 import process from "node:process";
-import { companionEnvFor, findCompanionScript, runCompanionCancel } from "../lib/companion-cancel.mjs";
-import { createLivenessProbe, killIfJobProcess } from "../lib/process-identity.mjs";
-import { StateLockBusyError, withStateLock, writeStateAtomic } from "../lib/state-store.mjs";
+import { fileURLToPath } from "node:url";
+import { createJobActions } from "../lib/job-actions.mjs";
+import { HttpError, samePath } from "../lib/job-target.mjs";
+import { defaultStateDirs } from "../lib/state-dirs.mjs";
+import { StateLockBusyError } from "../lib/state-store.mjs";
 
 const HOST = "127.0.0.1";
 const DEFAULT_PORT = 4317;
-const PLUGIN_DATA_STATE_DIR = path.join(os.homedir(), ".claude", "plugins", "data", "codex-openai-codex", "state");
-const BASE_DIRS = [PLUGIN_DATA_STATE_DIR, path.join(os.tmpdir(), "codex-companion")];
-const ACTIVE_STATUSES = new Set(["running", "queued"]);
+const MAX_PORT = 65535;
 const MAX_BODY_BYTES = 1024 * 1024;
-const DASHBOARD_CANCEL_MESSAGE = "Cancelled via dashboard.";
-const livenessProbe = createLivenessProbe();
-
-class HttpError extends Error {
-  constructor(statusCode, message) {
-    super(message);
-    this.name = "HttpError";
-    this.statusCode = statusCode;
-  }
-}
 
 function parsePort(argv) {
   const portIndex = argv.indexOf("--port");
@@ -32,451 +20,16 @@ function parsePort(argv) {
     return DEFAULT_PORT;
   }
 
-  const port = Number(argv[portIndex + 1]);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error("--port must be an integer between 1 and 65535.");
+  const value = argv[portIndex + 1] ?? "";
+  const port = /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  if (!Number.isInteger(port) || port > MAX_PORT) {
+    throw new Error(`--port must be an integer between 0 and ${MAX_PORT}.`);
   }
   return port;
 }
 
-function isJobRecord(value) {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-async function probeActiveJob(job) {
-  return ACTIVE_STATUSES.has(job.status) ? livenessProbe.probe(job) : null;
-}
-
-function isStaleLiveness(job, alive) {
-  return ACTIVE_STATUSES.has(job.status) && alive === false;
-}
-
-function readStateFile(statePath) {
-  try {
-    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    return isJobRecord(state) && Array.isArray(state.jobs) ? state : null;
-  } catch {
-    return null;
-  }
-}
-
-function collectJobRecords() {
-  const records = [];
-  const seen = new Set();
-
-  for (const baseDir of BASE_DIRS) {
-    let entries;
-    try {
-      entries = fs.readdirSync(baseDir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      if (!entry.isDirectory()) {
-        continue;
-      }
-
-      const dirName = entry.name;
-      const statePath = path.join(baseDir, dirName, "state.json");
-      // Missing, unreadable, and malformed state files are intentionally skipped.
-      const state = readStateFile(statePath);
-      if (!state) {
-        continue;
-      }
-
-      const repo = dirName.replace(/-[0-9a-f]{16}$/, "");
-      for (const sourceJob of state.jobs) {
-        if (!isJobRecord(sourceJob)) {
-          continue;
-        }
-
-        const dedupeKey = `${dirName}:${sourceJob.id}`;
-        if (seen.has(dedupeKey)) {
-          continue;
-        }
-        seen.add(dedupeKey);
-
-        records.push({
-          view: {
-            ...sourceJob,
-            repo,
-            dirName,
-            baseDir,
-          },
-          sourceJob,
-          statePath,
-          repo,
-          dirName,
-          baseDir,
-        });
-      }
-    }
-  }
-
-  return records;
-}
-
-async function withLiveness(record) {
-  const alive = await probeActiveJob(record.sourceJob);
-  const stale = isStaleLiveness(record.sourceJob, alive);
-  return { ...record, view: { ...record.view, alive, stale } };
-}
-
-async function scanAllJobRecords() {
-  return Promise.all(collectJobRecords().map(withLiveness));
-}
-
-function bestEffortKill(pid) {
-  try {
-    if (process.platform === "win32") {
-      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        stdio: "ignore",
-        windowsHide: true,
-      });
-    } else {
-      process.kill(pid, "SIGTERM");
-    }
-  } catch {
-    // The process may already be gone; cancellation still updates the job state.
-  }
-}
-
-function bestEffortAppendCancellationLog(job, timestamp) {
-  try {
-    if (typeof job.logFile === "string" && fs.existsSync(job.logFile)) {
-      fs.appendFileSync(
-        job.logFile,
-        `[${timestamp}] Cancelled via dashboard GUI.\n`,
-        "utf8",
-      );
-    }
-  } catch {
-    // Logging must not make an otherwise successful cancellation fail.
-  }
-}
-
-function cancelledJob(job, timestamp) {
-  return {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: DASHBOARD_CANCEL_MESSAGE,
-    completedAt: timestamp,
-    cancelledAt: timestamp,
-    updatedAt: timestamp,
-  };
-}
-
-function jobFilePath(repoDir, jobId) {
-  return path.join(repoDir, "jobs", `${jobId}.json`);
-}
-
-function readJobFile(filePath) {
-  try {
-    const job = JSON.parse(fs.readFileSync(filePath, "utf8"));
-    return isJobRecord(job) ? job : null;
-  } catch {
-    return null;
-  }
-}
-
-// Mirrors the plugin's cancel: /codex:status and /codex:result read jobs/<id>.json, not state.json.
-async function bestEffortMergeIntoJobFile(repoDir, job) {
-  const filePath = jobFilePath(repoDir, job.id);
-  const existing = readJobFile(filePath);
-  if (!existing) {
-    return;
-  }
-  try {
-    await writeStateAtomic(filePath, { ...existing, ...job });
-  } catch {
-    // state.json already records the cancellation; the sidecar must not fail the request.
-  }
-}
-
-function isNonEmptyString(value) {
-  return typeof value === "string" && value.trim().length > 0;
-}
-
-function samePath(left, right) {
-  const normalizedLeft = path.resolve(left);
-  const normalizedRight = path.resolve(right);
-  if (process.platform === "win32") {
-    return normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
-  }
-  return normalizedLeft === normalizedRight;
-}
-
-function isSafePathSegment(value) {
-  return (
-    isNonEmptyString(value) &&
-    value !== "." &&
-    value !== ".." &&
-    path.basename(value) === value
-  );
-}
-
-function requireJobTarget(body) {
-  if (
-    !body ||
-    typeof body !== "object" ||
-    Array.isArray(body) ||
-    !isNonEmptyString(body.baseDir) ||
-    !isNonEmptyString(body.dirName) ||
-    !isNonEmptyString(body.jobId)
-  ) {
-    throw new HttpError(400, "baseDir, dirName, and jobId are required.");
-  }
-
-  const baseDir = BASE_DIRS.find((candidate) => samePath(candidate, body.baseDir));
-  if (!baseDir) {
-    throw new HttpError(400, "baseDir is not a recognized Codex Companion state directory.");
-  }
-  if (!isSafePathSegment(body.dirName)) {
-    throw new HttpError(400, "dirName must be a direct state-directory name.");
-  }
-  if (!isSafePathSegment(body.jobId)) {
-    throw new HttpError(400, "jobId must be a simple job identifier.");
-  }
-
-  const repoDir = path.resolve(baseDir, body.dirName);
-  if (!samePath(path.dirname(repoDir), baseDir)) {
-    throw new HttpError(400, "dirName must resolve directly beneath baseDir.");
-  }
-
-  return {
-    baseDir,
-    dirName: body.dirName,
-    jobId: body.jobId,
-    repoDir,
-    statePath: path.join(repoDir, "state.json"),
-  };
-}
-
-function readTargetState(target) {
-  let text;
-  try {
-    text = fs.readFileSync(target.statePath, "utf8");
-  } catch (error) {
-    if (error && error.code === "ENOENT") {
-      throw new HttpError(404, "Job not found.");
-    }
-    throw error;
-  }
-
-  const state = JSON.parse(text);
-  if (!state || typeof state !== "object" || !Array.isArray(state.jobs)) {
-    throw new HttpError(404, "Job not found.");
-  }
-  return state;
-}
-
-function findJob(state, jobId) {
-  return state.jobs.find((job) => job && typeof job === "object" && job.id === jobId);
-}
-
-async function mutateTargetState(target, mutate) {
-  if (!fs.existsSync(target.statePath)) {
-    throw new HttpError(404, "Job not found.");
-  }
-
-  return withStateLock(target.repoDir, async () => {
-    const state = readTargetState(target);
-    const result = mutate(state);
-    await writeStateAtomic(target.statePath, state);
-    return result;
-  });
-}
-
-function requireActiveJob(state, jobId) {
-  const job = findJob(state, jobId);
-  if (!job) {
-    throw new HttpError(404, "Job not found.");
-  }
-  if (!ACTIVE_STATUSES.has(job.status)) {
-    throw new HttpError(400, "Only running or queued jobs can be cancelled.");
-  }
-  return job;
-}
-
-function cancelActiveJob(state, jobId) {
-  const original = requireActiveJob(state, jobId);
-  const cancelled = cancelledJob(original, new Date().toISOString());
-  state.jobs = state.jobs.map((job) => (job === original ? cancelled : job));
-  return { original, cancelled };
-}
-
-async function stopCancelledJob(original, cancelled) {
-  await killIfJobProcess(original, { probe: livenessProbe, kill: bestEffortKill });
-  bestEffortAppendCancellationLog(cancelled, cancelled.completedAt);
-}
-
-async function cancelInDashboard(target) {
-  const { original, cancelled } = await mutateTargetState(target, (state) =>
-    cancelActiveJob(state, target.jobId),
-  );
-  await bestEffortMergeIntoJobFile(target.repoDir, cancelled);
-  await stopCancelledJob(original, cancelled);
-  return cancelled;
-}
-
-function hasCancelArguments(job) {
-  return (
-    isNonEmptyString(job.workspaceRoot) &&
-    path.isAbsolute(job.workspaceRoot) &&
-    !job.id.startsWith("-")
-  );
-}
-
-// Only a verified live worker goes to the plugin: its cancel kills job.pid without checking whose it is.
-async function shouldDelegateCancel(job) {
-  return hasCancelArguments(job) && (await livenessProbe.probeFresh(job)) === true;
-}
-
-async function cancelViaCompanion(target, job) {
-  const script = findCompanionScript();
-  if (!script || !(await shouldDelegateCancel(job))) {
-    return { handled: false, plugin: null };
-  }
-
-  const plugin = await runCompanionCancel({
-    script,
-    jobId: job.id,
-    workspaceRoot: job.workspaceRoot,
-    env: companionEnvFor(target.baseDir, { pluginDataStateDir: PLUGIN_DATA_STATE_DIR, samePath }),
-  });
-  // The state file decides, not the exit code: the plugin may have resolved another state directory.
-  const current = findJob(readTargetState(target), target.jobId);
-  return { handled: current?.status === "cancelled", plugin, job: current };
-}
-
-async function cancelOneJob(body) {
-  const target = requireJobTarget(body);
-  const job = requireActiveJob(readTargetState(target), target.jobId);
-
-  const delegated = await cancelViaCompanion(target, job);
-  if (delegated.handled) {
-    return { job: delegated.job, cancelledVia: "plugin", plugin: delegated.plugin };
-  }
-
-  const cancelled = await cancelInDashboard(target);
-  return { job: cancelled, cancelledVia: "dashboard", plugin: delegated.plugin };
-}
-
-function groupStaleJobsByStateFile(records) {
-  const groups = new Map();
-  for (const record of records.filter((candidate) => candidate.view.stale)) {
-    const group = groups.get(record.statePath) ?? {
-      statePath: record.statePath,
-      dirName: record.dirName,
-      repo: record.repo,
-      stalePids: new Map(),
-    };
-    group.stalePids.set(record.sourceJob.id, record.sourceJob.pid);
-    groups.set(record.statePath, group);
-  }
-  return [...groups.values()];
-}
-
-// The scan already proved these PIDs dead or foreign; re-inspecting here would run a subprocess under the lock.
-function isStillStale(job, stalePids) {
-  return (
-    isJobRecord(job) &&
-    ACTIVE_STATUSES.has(job.status) &&
-    stalePids.has(job.id) &&
-    stalePids.get(job.id) === job.pid
-  );
-}
-
-async function cancelJobsStillStale(statePath, stalePids) {
-  const state = readStateFile(statePath);
-  if (!state) {
-    return [];
-  }
-
-  const jobs = state.jobs.filter((job) => isStillStale(job, stalePids));
-  if (jobs.length === 0) {
-    return [];
-  }
-
-  const timestamp = new Date().toISOString();
-  const replacements = new Map(jobs.map((job) => [job, cancelledJob(job, timestamp)]));
-  const nextState = { ...state, jobs: state.jobs.map((job) => replacements.get(job) ?? job) };
-  await writeStateAtomic(statePath, nextState);
-  return [...replacements.values()];
-}
-
-async function purgeStateFile(group) {
-  try {
-    return await withStateLock(path.dirname(group.statePath), () =>
-      cancelJobsStillStale(group.statePath, group.stalePids),
-    );
-  } catch (error) {
-    if (error instanceof StateLockBusyError) {
-      return null;
-    }
-    throw error;
-  }
-}
-
-async function purgeStaleJobs() {
-  const purged = [];
-  const skipped = [];
-
-  for (const group of groupStaleJobsByStateFile(await scanAllJobRecords())) {
-    const jobs = await purgeStateFile(group);
-    if (jobs === null) {
-      skipped.push({ dirName: group.dirName, repo: group.repo, reason: "state file locked" });
-      continue;
-    }
-
-    for (const job of jobs) {
-      // A stale PID is dead or belongs to an unrelated process, so purging never kills anything.
-      await bestEffortMergeIntoJobFile(path.dirname(group.statePath), job);
-      bestEffortAppendCancellationLog(job, job.completedAt);
-      purged.push({ dirName: group.dirName, jobId: job.id, repo: group.repo });
-    }
-  }
-
-  return { purged, skipped };
-}
-
-function bestEffortDeleteFile(filePath) {
-  try {
-    fs.unlinkSync(filePath);
-  } catch {
-    // Missing or inaccessible job sidecar files do not fail the delete request.
-  }
-}
-
-function removeFinishedJob(state, jobId) {
-  const jobIndex = state.jobs.findIndex(
-    (job) => job && typeof job === "object" && job.id === jobId,
-  );
-
-  if (jobIndex === -1) {
-    throw new HttpError(404, "Job not found.");
-  }
-
-  const job = state.jobs[jobIndex];
-  if (ACTIVE_STATUSES.has(job.status)) {
-    throw new HttpError(400, "This job is running or queued; cancel it first.");
-  }
-
-  state.jobs.splice(jobIndex, 1);
-}
-
-async function deleteOneJob(body) {
-  const target = requireJobTarget(body);
-  await mutateTargetState(target, (state) => removeFinishedJob(state, target.jobId));
-
-  const jobsDir = path.join(target.baseDir, target.dirName, "jobs");
-  bestEffortDeleteFile(path.join(jobsDir, `${target.jobId}.log`));
-  bestEffortDeleteFile(path.join(jobsDir, `${target.jobId}.json`));
-
-  return target.jobId;
+export function parseServerArgs(argv) {
+  return { port: parsePort(argv), openBrowser: !argv.includes("--no-open") };
 }
 
 function readJsonBody(request) {
@@ -1193,7 +746,7 @@ const HTML_PAGE = `<!doctype html>
 </html>
 `;
 
-async function handleRequest(request, response) {
+async function handleRequest(actions, request, response) {
   const requestUrl = new URL(request.url || "/", `http://${HOST}`);
   const pathname = requestUrl.pathname;
 
@@ -1203,27 +756,27 @@ async function handleRequest(request, response) {
   }
 
   if (request.method === "GET" && pathname === "/api/jobs") {
-    const jobs = (await scanAllJobRecords()).map((record) => record.view);
+    const jobs = await actions.listJobs();
     sendJson(response, 200, { jobs });
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/jobs/cancel") {
     const body = await readJsonBody(request);
-    const cancellation = await cancelOneJob(body);
+    const cancellation = await actions.cancelJob(body);
     sendJson(response, 200, { ok: true, ...cancellation });
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/jobs/purge-stale") {
-    const { purged, skipped } = await purgeStaleJobs();
+    const { purged, skipped } = await actions.purgeStaleJobs();
     sendJson(response, 200, { ok: true, purged, skipped });
     return;
   }
 
   if (request.method === "POST" && pathname === "/api/jobs/delete") {
     const body = await readJsonBody(request);
-    const deleted = await deleteOneJob(body);
+    const deleted = await actions.deleteJob(body);
     sendJson(response, 200, { ok: true, deleted });
     return;
   }
@@ -1252,29 +805,67 @@ function errorStatusCode(error) {
   return 500;
 }
 
-const port = parsePort(process.argv.slice(2));
-const server = http.createServer((request, response) => {
-  handleRequest(request, response).catch((error) => {
-    const statusCode = errorStatusCode(error);
-    const message = error instanceof Error ? error.message : String(error);
+function respondWithError(response, error) {
+  const statusCode = errorStatusCode(error);
+  const message = error instanceof Error ? error.message : String(error);
 
-    if (!response.headersSent) {
-      sendJson(response, statusCode, { error: message });
-    } else if (!response.writableEnded) {
-      response.end();
-    }
-  });
-});
-
-server.listen(port, HOST, () => {
-  const url = `http://${HOST}:${port}`;
-  console.log(`Codex Dashboard running at ${url}`);
-
-  if (process.platform === "win32") {
-    try {
-      exec(`start "" "${url}"`, { windowsHide: true }, () => {});
-    } catch {
-      // Auto-opening the browser is a convenience and must never crash the server.
-    }
+  if (!response.headersSent) {
+    sendJson(response, statusCode, { error: message });
+  } else if (!response.writableEnded) {
+    response.end();
   }
-});
+}
+
+function serverUrl(server) {
+  return `http://${HOST}:${server.address().port}`;
+}
+
+function launchBrowserOnWindows(url) {
+  if (process.platform !== "win32") {
+    return;
+  }
+  try {
+    exec(`start "" "${url}"`, { windowsHide: true }, () => {});
+  } catch {
+    // Auto-opening the browser is a convenience and must never crash the server.
+  }
+}
+
+export function createServer({
+  baseDirs = defaultStateDirs(),
+  openBrowser = false,
+  launchBrowser = launchBrowserOnWindows,
+} = {}) {
+  const actions = createJobActions({ baseDirs });
+  const server = http.createServer((request, response) => {
+    handleRequest(actions, request, response).catch((error) => respondWithError(response, error));
+  });
+
+  if (openBrowser) {
+    server.once("listening", () => launchBrowser(serverUrl(server)));
+  }
+  return server;
+}
+
+function isMainModule() {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return samePath(fs.realpathSync(process.argv[1]), fs.realpathSync(fileURLToPath(import.meta.url)));
+  } catch {
+    return false;
+  }
+}
+
+function main(argv) {
+  const { port, openBrowser } = parseServerArgs(argv);
+  const server = createServer({ openBrowser });
+  server.listen(port, HOST, () => {
+    console.log(`Codex Dashboard running at ${serverUrl(server)}`);
+  });
+}
+
+if (isMainModule()) {
+  main(process.argv.slice(2));
+}

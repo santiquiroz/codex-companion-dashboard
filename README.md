@@ -32,6 +32,7 @@ codex-dashboard --json       # machine-readable output, for scripting
 
 codex-dashboard-gui          # start the web UI at http://127.0.0.1:4317
 codex-dashboard-gui --port 5000
+codex-dashboard-gui --port 0 --no-open   # any free port, don't open the browser
 ```
 
 The GUI lets you:

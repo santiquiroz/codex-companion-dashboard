@@ -1,12 +1,11 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-const SERVER_SCRIPT = fileURLToPath(new URL("../../bin/codex-dashboard-server.mjs", import.meta.url));
+export const SERVER_SCRIPT = fileURLToPath(new URL("../../bin/codex-dashboard-server.mjs", import.meta.url));
 export const REPO_DIR_NAME = "demo-repo-0123456789abcdef";
 
 export function createSandbox() {
@@ -23,10 +22,10 @@ export function createSandbox() {
 export function sandboxEnv(sandbox, extraEnv = {}) {
   const env = Object.fromEntries(
     Object.entries(process.env).filter(
-      ([key]) => !/^(comspec|userprofile|home|temp|tmp|tmpdir|codex_companion_script)$/i.test(key),
+      ([key]) => !/^(comspec|userprofile|home|temp|tmp|tmpdir|codex_companion_script|codex_companion_state_dir)$/i.test(key),
     ),
   );
-  // An unusable shell makes the server's Windows "start <url>" fail instead of opening a browser.
+  // Backs up --no-open: an unusable shell makes any Windows "start <url>" fail instead of opening a browser.
   env.ComSpec = path.join(sandbox.root, "no-shell.exe");
   env.USERPROFILE = sandbox.home;
   env.HOME = sandbox.home;
@@ -36,16 +35,7 @@ export function sandboxEnv(sandbox, extraEnv = {}) {
   return { ...env, ...extraEnv };
 }
 
-export function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const probe = net.createServer();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const { port } = probe.address();
-      probe.close(() => resolve(port));
-    });
-  });
-}
+const LISTENING_PATTERN = /Codex Dashboard running at (http:\/\/\S+)/;
 
 export function waitForListening(child) {
   return new Promise((resolve, reject) => {
@@ -53,8 +43,9 @@ export function waitForListening(child) {
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       output += chunk;
-      if (output.includes("Codex Dashboard running at")) {
-        resolve();
+      const match = LISTENING_PATTERN.exec(output);
+      if (match) {
+        resolve(match[1]);
       }
     });
     child.once("exit", (code) => reject(new Error(`server exited early with code ${code}`)));
@@ -62,14 +53,13 @@ export function waitForListening(child) {
 }
 
 export async function startServer(sandbox, extraEnv) {
-  const port = await findFreePort();
-  const child = spawn(process.execPath, [SERVER_SCRIPT, "--port", String(port)], {
+  const child = spawn(process.execPath, [SERVER_SCRIPT, "--port", "0", "--no-open"], {
     env: sandboxEnv(sandbox, extraEnv),
     stdio: ["ignore", "pipe", "inherit"],
     windowsHide: true,
   });
-  await waitForListening(child);
-  return { child, url: `http://127.0.0.1:${port}` };
+  const url = await waitForListening(child);
+  return { child, url };
 }
 
 export function stopServer(server) {
