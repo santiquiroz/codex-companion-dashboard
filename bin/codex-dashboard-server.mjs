@@ -6,6 +6,8 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { createJobActions } from "../lib/job-actions.mjs";
 import { HttpError, samePath } from "../lib/job-target.mjs";
+import { assertLoopbackRequest } from "../lib/loopback-guard.mjs";
+import { pageContentSecurityPolicy } from "../lib/page-policy.mjs";
 import { resolveStateDirs } from "../lib/state-dirs.mjs";
 import { StateLockBusyError } from "../lib/state-store.mjs";
 
@@ -13,6 +15,11 @@ const HOST = "127.0.0.1";
 const DEFAULT_PORT = 4317;
 const MAX_PORT = 65535;
 const MAX_BODY_BYTES = 1024 * 1024;
+const BASE_HEADERS = {
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+};
 
 function parsePort(argv) {
   const portIndex = argv.indexOf("--port");
@@ -77,8 +84,7 @@ function sendJson(response, statusCode, payload) {
   response.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(content),
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
+    ...BASE_HEADERS,
   });
   response.end(content);
 }
@@ -87,8 +93,8 @@ function sendHtml(response) {
   response.writeHead(200, {
     "Content-Type": "text/html; charset=utf-8",
     "Content-Length": Buffer.byteLength(HTML_PAGE),
-    "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": PAGE_SECURITY_POLICY,
+    ...BASE_HEADERS,
   });
   response.end(HTML_PAGE);
 }
@@ -753,7 +759,10 @@ const HTML_PAGE = `<!doctype html>
 </html>
 `;
 
+const PAGE_SECURITY_POLICY = pageContentSecurityPolicy(HTML_PAGE);
+
 async function handleRequest(actions, request, response) {
+  assertLoopbackRequest({ method: request.method, headers: request.headers, port: request.socket.localPort });
   const requestUrl = new URL(request.url || "/", `http://${HOST}`);
   const pathname = requestUrl.pathname;
 
@@ -797,7 +806,7 @@ async function handleRequest(actions, request, response) {
   response.writeHead(404, {
     "Content-Type": "text/plain; charset=utf-8",
     "Content-Length": Buffer.byteLength(content),
-    "Cache-Control": "no-store",
+    ...BASE_HEADERS,
   });
   response.end(content);
 }
