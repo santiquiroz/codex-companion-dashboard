@@ -1,6 +1,6 @@
 {
   "name": "codex-companion-dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-project terminal and web dashboard for Codex Companion background jobs in Claude Code",
   "type": "module",
   "bin": {
